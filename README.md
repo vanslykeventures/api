@@ -1,6 +1,6 @@
 # API
 
-This project exposes a serverless endpoint at `/api/umpbot`.
+This project exposes serverless endpoints at `/api`, `/api/umpbot`, and `/api/ping`.
 
 ## Endpoint
 
@@ -17,6 +17,25 @@ It returns:
 
 ```json
 { "text": "..." }
+```
+
+- `GET /api/ping`
+
+It returns:
+
+```json
+{ "pong": true }
+```
+
+- `GET /api`
+
+It returns:
+
+```json
+{
+  "message": "Hi, this is just an API.",
+  "endpoints": ["/api/ping", "/api/umpbot"]
+}
 ```
 
 ## Environment Variables
