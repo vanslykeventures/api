@@ -1,0 +1,13 @@
+{
+  "name": "wybsl-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "redis": "^4.7.0"
+  }
+}
