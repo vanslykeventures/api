@@ -41,10 +41,6 @@ It returns:
 ## Environment Variables
 
 - `GEMINI_API_KEY` (required)
-- `GEMINI_MODEL` (optional, default: `gemini-2.5-flash`)
-- `REDIS_URL` (optional, enables PDF text caching)
-- `UMPBOT_PDF_ROOT` (optional)
-  - defaults to `../../wybsl_mobile/files/UmpBot` relative to `api/api/umpbot.js`
 
 ## Example Request
 
