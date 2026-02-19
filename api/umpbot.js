@@ -8,7 +8,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const REDIS_URL = process.env.REDIS_URL || '';
 const PDF_ROOT =
   process.env.UMPBOT_PDF_ROOT ||
-  path.resolve(__dirname, '../../wybsl_mobile/files/UmpBot');
+  path.resolve(__dirname, '../files/UmpBot');
 
 let redisClient;
 
