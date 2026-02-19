@@ -1,6 +1,6 @@
 # API
 
-This project exposes serverless endpoints at `/api`, `/api/umpbot`, and `/api/ping`.
+This project exposes serverless endpoints at `/`, `/api/umpbot`, and `/api/ping`.
 
 ## Endpoint
 
@@ -27,7 +27,7 @@ It returns:
 { "pong": true }
 ```
 
-- `GET /api`
+- `GET /`
 
 It returns:
 
