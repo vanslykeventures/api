@@ -15,6 +15,8 @@ Run with `npx vercel dev`
   - `teeball_level`
   - `question`
   - `message`
+  - `action` (optional)
+    - `seed_pdf_cache` to parse all PDFs under `files/` and save each PDF text as its own Redis entry
 
 It returns:
 
@@ -46,6 +48,7 @@ It returns:
 - `GEMINI_API_KEY` (required)
 - `REDIS_URL` (required for `/api/redis`)
 - `REDIS_KEY_PREFIX` (optional, default: `umpbot:dev:`)
+- `UMPBOT_SEED_PDF_ROOT` (optional, default: `../files`)
 
 ## Redis Route
 
@@ -68,4 +71,12 @@ curl -X POST http://localhost:3000/api/umpbot \
     "age_range": "U12",
     "question": "A runner left early on a caught fly ball. Is this an out?"
   }'
+```
+
+## Seed All PDFs Into Redis
+
+```bash
+curl -X POST http://localhost:3000/api/umpbot \
+  -H "Content-Type: application/json" \
+  -d '{"action":"seed_pdf_cache"}'
 ```

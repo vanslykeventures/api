@@ -1,12 +1,16 @@
 const fs = require('fs');
 const path = require('path');
 const pdfParse = require('pdf-parse');
+const { redisGet, redisSet } = require('./controllers/redis-controller');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const PDF_ROOT =
   process.env.UMPBOT_PDF_ROOT ||
   path.resolve(__dirname, '../files/UmpBot');
+const PDF_SEED_ROOT =
+  process.env.UMPBOT_SEED_PDF_ROOT ||
+  path.resolve(__dirname, '../files');
 
 const readRequestBody = (req) =>
   new Promise((resolve) => {
@@ -143,6 +147,8 @@ const listPdfFiles = async (root) => {
 const relativePosix = (filePath, root) =>
   path.relative(root, filePath).split(path.sep).join('/');
 
+const getPdfCacheKey = (filePath) => `pdf:text:${relativePosix(filePath, PDF_SEED_ROOT)}`;
+
 const allLeagueRules = (filePath) => /ALL-LEAGUE-RULES/i.test(filePath);
 
 const selectPdfFiles = async (context) => {
@@ -211,6 +217,58 @@ const fetchPdfText = async (filePath) => {
   return parsed.text || '';
 };
 
+const fetchPdfTextFromCacheOrFile = async (filePath) => {
+  const cacheKey = getPdfCacheKey(filePath);
+
+  try {
+    const cached = await redisGet(cacheKey);
+    if (cached) {
+      return cached;
+    }
+  } catch (error) {
+    console.warn(`UmpBot pdf cache read failed (${cacheKey}):`, error.message);
+  }
+
+  const parsedText = await fetchPdfText(filePath);
+
+  try {
+    await redisSet(cacheKey, parsedText);
+  } catch (error) {
+    console.warn(`UmpBot pdf cache write failed (${cacheKey}):`, error.message);
+  }
+
+  return parsedText;
+};
+
+const seedPdfCache = async () => {
+  const pdfFiles = await listPdfFiles(PDF_SEED_ROOT);
+  let seeded = 0;
+  let cacheHits = 0;
+  const keys = [];
+
+  for (const filePath of pdfFiles) {
+    const cacheKey = getPdfCacheKey(filePath);
+    keys.push(cacheKey);
+
+    const existing = await redisGet(cacheKey);
+    if (existing) {
+      cacheHits += 1;
+      continue;
+    }
+
+    const parsedText = await fetchPdfText(filePath);
+    await redisSet(cacheKey, parsedText);
+    seeded += 1;
+  }
+
+  return {
+    total_files: pdfFiles.length,
+    seeded,
+    cache_hits: cacheHits,
+    keys,
+  };
+};
+
 const readTextBrain = async () => {
   const entries = await fs.promises.readdir(PDF_ROOT, { withFileTypes: true });
   const textFiles = entries
@@ -260,6 +318,10 @@ const generateModelResponse = async (prompt) => {
 };
 
 const parsePayload = async (req) => {
+  if (typeof req.body === 'string') {
+    return parseJsonBody(Buffer.from(req.body, 'utf8'));
+  }
+
   if (req.body && typeof req.body === 'object') {
     return req.body;
   }
@@ -284,16 +346,31 @@ module.exports = async (req, res) => {
   }
 
   try {
+    const payload = await parsePayload(req);
+    const action = payload?.action || req?.query?.action;
+
+    if (action === 'seed_pdf_cache') {
+      if (!fs.existsSync(PDF_SEED_ROOT)) {
+        res.status(500).json({ error: `Seed PDF root not found: ${PDF_SEED_ROOT}` });
+        return;
+      }
+      const seedResult = await seedPdfCache();
+      res.status(200).json({ ok: true, action: 'seed_pdf_cache', ...seedResult });
+      return;
+    }
+
     if (!fs.existsSync(PDF_ROOT)) {
       res.status(500).json({ error: `PDF root not found: ${PDF_ROOT}` });
       return;
     }
 
-    const payload = await parsePayload(req);
     const task = buildTaskFromFields(payload);
 
     if (!task) {
-      res.status(400).json({ error: 'Missing task payload.' });
+      res.status(400).json({
+        error: 'Missing task payload.',
+        hint: 'Use {"action":"seed_pdf_cache"} to seed all PDFs into Redis.',
+      });
       return;
     }
 
@@ -303,7 +380,7 @@ module.exports = async (req, res) => {
 
     let pdfBrain = '';
     for (const filePath of pdfFiles) {
-      pdfBrain += await fetchPdfText(filePath);
+      pdfBrain += await fetchPdfTextFromCacheOrFile(filePath);
     }
 
     const prompt = buildPrompt(task, textBrain, pdfBrain);
