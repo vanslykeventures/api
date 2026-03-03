@@ -1,6 +1,9 @@
 # API
 
-This project exposes serverless endpoints at `/`, `/api/umpbot`, and `/api/ping`.
+This project exposes serverless endpoints at `/`, `/api/umpbot`, `/api/ping`, and `/api/redis`.
+
+## Run
+Run with `npx vercel dev`
 
 ## Endpoint
 
@@ -34,13 +37,25 @@ It returns:
 ```json
 {
   "message": "Hi, this is just an API.",
-  "endpoints": ["/api/ping", "/api/umpbot"]
+  "endpoints": ["/api/ping", "/api/umpbot", "/api/redis"]
 }
 ```
 
 ## Environment Variables
 
 - `GEMINI_API_KEY` (required)
+- `REDIS_URL` (required for `/api/redis`)
+- `REDIS_KEY_PREFIX` (optional, default: `umpbot:dev:`)
+
+## Redis Route
+
+- `GET /api/redis`
+  - checks connectivity with Redis `PING`
+- `POST /api/redis`
+  - body:
+    - `{"action":"set","key":"test","value":"hello","ttl_seconds":300}`
+    - `{"action":"get","key":"test"}`
+    - `{"action":"del","key":"test"}`
 
 ## Example Request
 

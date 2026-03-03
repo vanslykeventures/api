@@ -15,6 +15,6 @@ module.exports = async (_req, res) => {
 
   res.status(200).json({
     message: 'Hi, this is just an API.',
-    endpoints: ['/api/ping', '/api/umpbot'],
+    endpoints: ['/api/ping', '/api/umpbot', '/api/redis'],
   });
 };

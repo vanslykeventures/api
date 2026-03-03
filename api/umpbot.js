@@ -1,16 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const pdfParse = require('pdf-parse');
-const { createClient } = require('redis');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const REDIS_URL = process.env.REDIS_URL || '';
 const PDF_ROOT =
   process.env.UMPBOT_PDF_ROOT ||
   path.resolve(__dirname, '../files/UmpBot');
-
-let redisClient;
 
 const readRequestBody = (req) =>
   new Promise((resolve) => {
@@ -38,22 +34,6 @@ const parseJsonBody = (body) => {
 };
 
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-const ensureRedisClient = async () => {
-  if (!REDIS_URL) {
-    return null;
-  }
-
-  if (!redisClient) {
-    redisClient = createClient({ url: REDIS_URL });
-    redisClient.on('error', (error) => {
-      console.error('Redis error:', error.message);
-    });
-    await redisClient.connect();
-  }
-
-  return redisClient;
-};
 
 const buildTaskFromFields = ({
   season,
@@ -225,27 +205,10 @@ const selectPdfFiles = async (context) => {
   return Array.from(new Set(results));
 };
 
-const fetchPdfText = async (filePath, redis) => {
-  const stat = await fs.promises.stat(filePath);
-  const relative = relativePosix(filePath, PDF_ROOT);
-  const cacheKey = `umpbot:pdf:${relative}:${Math.floor(stat.mtimeMs / 1000)}`;
-
-  if (redis) {
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
-  }
-
+const fetchPdfText = async (filePath) => {
   const buffer = await fs.promises.readFile(filePath);
   const parsed = await pdfParse(buffer);
-  const text = parsed.text || '';
-
-  if (redis) {
-    await redis.set(cacheKey, text);
-  }
-
-  return text;
+  return parsed.text || '';
 };
 
 const readTextBrain = async () => {
@@ -334,20 +297,13 @@ module.exports = async (req, res) => {
       return;
     }
 
-    let redis = null;
-    try {
-      redis = await ensureRedisClient();
-    } catch (error) {
-      console.error('Redis init failed, continuing without cache:', error.message);
-    }
-
     const context = extractContext(task);
     const pdfFiles = await selectPdfFiles(context);
     const textBrain = await readTextBrain();
 
     let pdfBrain = '';
     for (const filePath of pdfFiles) {
-      pdfBrain += await fetchPdfText(filePath, redis);
+      pdfBrain += await fetchPdfText(filePath);
     }
 
     const prompt = buildPrompt(task, textBrain, pdfBrain);
