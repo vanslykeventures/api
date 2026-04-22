@@ -6,6 +6,10 @@
   },
   "rewrites": [
     {
+      "source": "/api/external/:path*",
+      "destination": "/api/external?path=:path*"
+    },
+    {
       "source": "/files/:path*",
       "destination": "/api/files/:path*"
     },

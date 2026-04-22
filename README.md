@@ -1,6 +1,6 @@
 # API
 
-This project exposes serverless endpoints at `/`, `/api/umpbot`, `/api/ping`, and `/api/redis`.
+This project exposes serverless endpoints at `/`, `/api/external/[...path]`, `/api/umpbot`, `/api/ping`, and `/api/redis`.
 
 ## Run
 Run with `npx vercel dev`
@@ -39,7 +39,7 @@ It returns:
 ```json
 {
   "message": "Hi, this is just an API.",
-  "endpoints": ["/api/ping", "/api/umpbot", "/api/redis"]
+  "endpoints": ["/api/ping", "/api/umpbot", "/api/redis", "/api/external/[...path]"]
 }
 ```
 
@@ -49,6 +49,17 @@ It returns:
 - `REDIS_URL` (required for `/api/redis`)
 - `REDIS_KEY_PREFIX` (optional, default: `umpbot:dev:`)
 - `UMPBOT_SEED_PDF_ROOT` (optional, default: `../files`)
+#### Set In Vercel
+- `EWYBSL_SOURCE_BASE_URL` (required for `/api/external/[...path]`)
+- `EWYBSL_SOURCE_API_KEY` (required for `/api/external/[...path]`)
+
+## External Proxy Route
+
+- `GET|POST|PUT|PATCH|DELETE /api/external/[...path]`
+- proxies requests to `${EWYBSL_SOURCE_BASE_URL}/api/[...path]`
+- injects the upstream `apikey` server-side
+- forwards `token`, `authorization`, `impersonate`, `userid`, and `password` headers as needed
+- intended for the mobile app so the EWYBSL API key never ships in the client bundle
 
 ## Redis Route
 
