@@ -151,10 +151,6 @@ const handleExternalProxyRequest = async (req, res) => {
   const response = await fetch(targetUrl, requestInit);
 
   const body = await response.text();
-  res.setHeader('X-External-Proxy-Method', req.method);
-  res.setHeader('X-External-Proxy-Path', relativePath || '<root>');
-  res.setHeader('X-External-Proxy-Target', targetUrl.toString());
-  res.setHeader('X-External-Proxy-Upstream-Status', String(response.status));
   res
     .status(response.status)
     .setHeader('Content-Type', response.headers.get('content-type') || 'application/json');
