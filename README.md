@@ -1,11 +1,11 @@
 # API
 
-This project exposes serverless endpoints at `/`, `/api/external/[...path]`, `/api/umpbot`, `/api/ping`, and `/api/redis`.
+This project exposes serverless endpoints at `/`, `/api/external/[...path]`, `/api/umpbot`, `/api/ping`, `/api/redis`, and `/api/push-reminders`.
 
 ## Run
 Run with `npx vercel dev`
 
-## Endpoint
+## Endpoints
 
 - `POST /api/umpbot`
 - Body fields (JSON):
@@ -32,6 +32,12 @@ It returns:
 { "pong": true }
 ```
 
+- `GET|POST /api/push-reminders`
+  - dormant push reminder worker scaffold
+  - reads Supabase push settings and returns a dry-run window
+  - does not send pushes until the worker is explicitly activated
+  - optional POST body: `{"dryRun": true, "windowMinutes": 10, "now": "2026-05-25T12:00:00Z"}`
+
 - `GET /`
 
 It returns:
@@ -39,7 +45,7 @@ It returns:
 ```json
 {
   "message": "Hi, this is just an API.",
-  "endpoints": ["/api/ping", "/api/umpbot", "/api/redis", "/api/external/[...path]"]
+  "endpoints": ["/api/ping", "/api/umpbot", "/api/redis", "/api/push-reminders", "/api/external/[...path]"]
 }
 ```
 
@@ -49,9 +55,13 @@ It returns:
 - `REDIS_URL` (required for `/api/redis`)
 - `REDIS_KEY_PREFIX` (optional, default: `umpbot:dev:`)
 - `UMPBOT_SEED_PDF_ROOT` (optional, default: `../files`)
+
 #### Set In Vercel
 - `EWYBSL_SOURCE_BASE_URL` (required for `/api/external/[...path]`)
 - `EWYBSL_SOURCE_API_KEY` (required for `/api/external/[...path]`)
+- `SUPABASE_URL` (required for `/api/push-reminders`)
+- `SUPABASE_SERVICE_ROLE_KEY` (required for `/api/push-reminders`)
+- `PUSH_REMINDER_CRON_SECRET` (optional, requires `X-Cron-Secret` when set)
 
 ## External Proxy Route
 
