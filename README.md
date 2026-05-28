@@ -33,10 +33,16 @@ It returns:
 ```
 
 - `GET|POST /api/push-reminders`
-  - dormant push reminder worker scaffold
-  - reads Supabase push settings and returns a dry-run window
-  - does not send pushes until the worker is explicitly activated
-  - optional POST body: `{"dryRun": true, "windowMinutes": 10, "now": "2026-05-25T12:00:00Z"}`
+  - planner and dispatcher for scheduled push reminders
+  - default mode is `dispatch` and default `dryRun` is `true`
+  - `mode=plan` fetches the schedule feed, builds the day plan, and can cache it in Redis at `push:plans:YYYY-MM-DD`
+  - plan cache entries use a 2-day TTL
+  - optional planner POST body: `{"mode":"plan", "date":"2026-05-25", "write": true}`
+  - pass `includePlannedWork=true` to include a grouped debug view in the planner response
+  - reads the Redis daily plan at `push:plans:YYYY-MM-DD`
+  - finds due items inside the check window and reports what would send
+  - optional dispatcher POST body: `{"mode":"dispatch", "date":"2026-05-25", "dryRun": true, "windowMinutes": 10, "now": "2026-05-25T12:00:00Z"}`
+  - `mode=status` only reads Supabase settings and returns the check window
 
 - `GET /`
 
@@ -52,7 +58,7 @@ It returns:
 ## Environment Variables
 
 - `GEMINI_API_KEY` (required)
-- `REDIS_URL` (required for `/api/redis`)
+- `REDIS_URL` (required for `/api/redis` and `/api/push-reminders` plan write/dispatch modes)
 - `REDIS_KEY_PREFIX` (optional, default: `umpbot:dev:`)
 - `UMPBOT_SEED_PDF_ROOT` (optional, default: `../files`)
 

@@ -1,6 +1,13 @@
+const { redisGet, redisSet, withPrefix } = require('./redis-controller');
+
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const CRON_SECRET = process.env.PUSH_REMINDER_CRON_SECRET || '';
+const SOURCE_BASE_URL = process.env.EWYBSL_SOURCE_BASE_URL || '';
+const SOURCE_API_KEY = process.env.EWYBSL_SOURCE_API_KEY || '';
+const PLAN_KEY_PREFIX = 'push:plans';
+const DEFAULT_WINDOW_MINUTES = 10;
+const PLAN_TTL_SECONDS = 2 * 24 * 60 * 60;
 
 const readRequestBody = (req) =>
   new Promise((resolve) => {
@@ -52,10 +59,113 @@ const parseRequestBody = async (req) => {
 
 const addMinutes = (date, minutes) => new Date(date.getTime() + minutes * 60 * 1000);
 
+const formatEasternDate = (date) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+};
+
+const addDaysToDateString = (dateString, days) => {
+  const [year, month, day] = String(dateString).split('-').map(Number);
+  if (!year || !month || !day) return dateString;
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return date.toISOString().slice(0, 10);
+};
+
+const getTimeZoneOffsetMinutes = (date, timeZone) => {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const asUtc = Date.UTC(
+    Number(byType.year),
+    Number(byType.month) - 1,
+    Number(byType.day),
+    Number(byType.hour),
+    Number(byType.minute),
+    Number(byType.second)
+  );
+  return (asUtc - date.getTime()) / 60000;
+};
+
+const easternWallTimeToDate = (dateString, timeString) => {
+  const [year, month, day] = String(dateString).split('-').map(Number);
+  const [hour = 0, minute = 0, second = 0] = String(timeString || '00:00:00').split(':').map(Number);
+  if (!year || !month || !day) return null;
+  const wallTimeAsUtc = Date.UTC(year, month - 1, day, hour || 0, minute || 0, second || 0);
+  const offset = getTimeZoneOffsetMinutes(new Date(wallTimeAsUtc), 'America/New_York');
+  return new Date(wallTimeAsUtc - offset * 60000);
+};
+
+const formatEasternTime = (date) =>
+  new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date);
+
+const extractTeamsFromInfo = (info) => {
+  const value = typeof info === 'string' ? info : '';
+  const [away, home] = value.split(/\s+@\s+/);
+  return {
+    away: away?.trim() || '',
+    home: home?.trim() || '',
+  };
+};
+
+const compact = (values) => values.filter((value) => value !== null && value !== undefined && value !== '');
+
+const replaceTemplate = (template, values) =>
+  String(template || '').replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key) =>
+    values[key] === null || values[key] === undefined ? '' : String(values[key])
+  );
+
 const requireSupabaseConfig = () => {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.');
   }
+};
+
+const requireSourceConfig = () => {
+  if (!SOURCE_BASE_URL || !SOURCE_API_KEY) {
+    throw new Error('Missing EWYBSL_SOURCE_BASE_URL or EWYBSL_SOURCE_API_KEY.');
+  }
+};
+
+const sourceApiGet = async (path, params = {}) => {
+  requireSourceConfig();
+  const url = new URL(`${SOURCE_BASE_URL.replace(/\/+$/, '')}/api/${String(path).replace(/^\/+/, '')}`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  url.searchParams.set('apikey', SOURCE_API_KEY);
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new Error(`Source API failed (${response.status}): ${text}`);
+  }
+  return payload;
 };
 
 const supabaseRest = async (path, init = {}) => {
@@ -104,24 +214,510 @@ const assertCronAllowed = (req) => {
   }
 };
 
-const handlePushReminderWorker = async (req, res) => {
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    res.status(405).json({ error: 'Method Not Allowed' });
-    return;
-  }
+const readQueryParam = (req, key) => {
+  const url = new URL(req.url || '/', 'http://localhost');
+  return url.searchParams.get(key) || '';
+};
 
-  assertCronAllowed(req);
-
+const getRequestOptions = async (req) => {
   const body = req.method === 'POST' ? await parseRequestBody(req) : {};
-  const dryRun = body.dryRun !== false;
-  const now = body.now ? new Date(body.now) : new Date();
-  const windowMinutes = Number.isFinite(body.windowMinutes) ? Number(body.windowMinutes) : 10;
+  const queryMode = readQueryParam(req, 'mode');
+  const queryDate = readQueryParam(req, 'date');
+  const queryDryRun = readQueryParam(req, 'dryRun');
+  const queryWrite = readQueryParam(req, 'write');
+  const queryIncludePlannedWork = readQueryParam(req, 'includePlannedWork');
+  const queryWindowMinutes = readQueryParam(req, 'windowMinutes');
+  const queryNow = readQueryParam(req, 'now');
 
-  if (Number.isNaN(now.getTime())) {
-    res.status(400).json({ error: 'Invalid now value.' });
-    return;
+  const now = body.now || queryNow ? new Date(body.now || queryNow) : new Date();
+  const windowMinutesValue = body.windowMinutes ?? (queryWindowMinutes ? Number(queryWindowMinutes) : undefined);
+  const windowMinutes = Number.isFinite(windowMinutesValue) ? Number(windowMinutesValue) : DEFAULT_WINDOW_MINUTES;
+  const dryRun = body.dryRun !== undefined
+    ? body.dryRun !== false
+    : queryDryRun
+      ? queryDryRun !== 'false'
+      : true;
+  const write = body.write !== undefined
+    ? body.write === true
+    : queryWrite
+      ? queryWrite === 'true'
+      : false;
+  const includePlannedWork = body.includePlannedWork !== undefined
+    ? body.includePlannedWork === true
+    : queryIncludePlannedWork
+      ? queryIncludePlannedWork === 'true'
+      : false;
+
+  return {
+    mode: body.mode || queryMode || 'dispatch',
+    date: body.date || queryDate || formatEasternDate(now),
+    dryRun,
+    write,
+    includePlannedWork,
+    now,
+    windowMinutes,
+  };
+};
+
+const normalizePlan = (rawPlan, date, redisKey) => {
+  if (!rawPlan) {
+    return {
+      found: false,
+      date,
+      redisKey,
+      createdAt: null,
+      items: [],
+    };
   }
 
+  const parsed = JSON.parse(rawPlan);
+  const items = Array.isArray(parsed) ? parsed : Array.isArray(parsed.items) ? parsed.items : [];
+  return {
+    found: true,
+    date: parsed.date || date,
+    redisKey,
+    createdAt: parsed.createdAt || null,
+    items: items.filter((item) => item && typeof item === 'object'),
+  };
+};
+
+const getPlanItemScheduledFor = (item) => {
+  const value = item.scheduledFor || item.scheduled_for;
+  if (typeof value !== 'string') return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const getPlanItemIdentity = (item) => ({
+  category: String(item.category || ''),
+  eventId: item.eventId ?? item.event_id ?? item.gameId ?? item.game_id ?? null,
+  teamId: item.teamId ?? item.team_id ?? null,
+});
+
+const encodeEq = (value) => `eq.${encodeURIComponent(String(value))}`;
+
+const findExistingRun = async (item) => {
+  const { category, eventId, teamId } = getPlanItemIdentity(item);
+  if (!category) return null;
+
+  const params = [
+    'select=id,category,event_id,team_id,sent_at',
+    `category=${encodeEq(category)}`,
+    eventId === null || eventId === undefined
+      ? 'event_id=is.null'
+      : `event_id=${encodeEq(eventId)}`,
+    teamId === null || teamId === undefined
+      ? 'team_id=is.null'
+      : `team_id=${encodeEq(teamId)}`,
+    'limit=1',
+  ];
+  const rows = await supabaseRest(`push_notification_runs?${params.join('&')}`);
+  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+};
+
+const postSupabaseFunction = async (functionName, payload) => {
+  requireSupabaseConfig();
+  const response = await fetch(`${SUPABASE_URL.replace(/\/+$/, '')}/functions/v1/${functionName}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  const parsed = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    throw new Error(`Supabase function ${functionName} failed (${response.status}): ${text}`);
+  }
+  return parsed;
+};
+
+const insertRunRecord = async (item, status, metadata = {}) => {
+  const { category, eventId, teamId } = getPlanItemIdentity(item);
+  if (!category) return null;
+
+  const scheduledFor = getPlanItemScheduledFor(item);
+  return supabaseRest('push_notification_runs', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify({
+      category,
+      event_id: eventId === null || eventId === undefined ? null : String(eventId),
+      team_id: teamId === null || teamId === undefined ? null : String(teamId),
+      scheduled_for: scheduledFor ? scheduledFor.toISOString() : null,
+      metadata: {
+        ...metadata,
+        status,
+      },
+    }),
+  });
+};
+
+const buildSendPushPayload = (item) => ({
+  title: item.title || 'WYBSL',
+  body: item.message || item.body || '',
+  message: item.message || item.body || '',
+  category: item.category || 'scheduled_reminder',
+  // TODO: Before enabling live dispatch, resolve team/role audiences into parent_ids
+  // from the source API so send-push can match rows in push_tokens.
+  audience: item.audience || { type: 'all' },
+  data: item.data || {},
+});
+
+const getSetting = (settingsByKey, key) => {
+  const setting = settingsByKey.get(key);
+  if (!setting || !setting.enabled) return null;
+  return setting;
+};
+
+const normalizeScheduleGames = (schedulePayload) => {
+  const rows = Array.isArray(schedulePayload?.results)
+    ? schedulePayload.results
+    : Array.isArray(schedulePayload)
+      ? schedulePayload
+      : [];
+
+  return rows
+    .filter((item) => (item.type ?? '').toLowerCase() === 'game')
+    .map((item) => {
+      const gameId = item.game_id ?? item.event_id ?? item.id;
+      const date = item.date;
+      const startTime = item.start_time || item.time || '';
+      const homeTeamId = item.home_team_id ? String(item.home_team_id) : '';
+      const awayTeamId = item.away_team_id ? String(item.away_team_id) : '';
+      const startsAt = date && startTime ? easternWallTimeToDate(date, startTime) : null;
+      const teams = extractTeamsFromInfo(item.info);
+      if (!gameId || !date || !startsAt || !homeTeamId || !awayTeamId) return null;
+
+      return {
+        gameId: String(gameId),
+        date,
+        startTime,
+        startsAt,
+        field: item.field || item.location || '',
+        leagueName: item.league_name || item.league || item.leagueName || '',
+        title: item.info || `${teams.away || `Team ${awayTeamId}`} @ ${teams.home || `Team ${homeTeamId}`}`,
+        awayTeamId,
+        homeTeamId,
+        awayName: teams.away || item.away_team || item.away_team_name || `Team ${awayTeamId}`,
+        homeName: teams.home || item.home_team || item.home_team_name || `Team ${homeTeamId}`,
+        raw: item,
+      };
+    })
+    .filter(Boolean);
+};
+
+const getTemplateValues = (game, teamId) => {
+  const isAway = teamId && teamId === game.awayTeamId;
+  const isHome = teamId && teamId === game.homeTeamId;
+  const teamName = isAway ? game.awayName : isHome ? game.homeName : '';
+  const opponentName = isAway ? game.homeName : isHome ? game.awayName : '';
+  const gameTimeText = formatEasternTime(game.startsAt);
+
+  return {
+    gameId: game.gameId,
+    gameTitle: game.title,
+    title: game.title,
+    teamId: teamId || '',
+    teamName,
+    opponentName,
+    gameDate: game.date,
+    gameTime: gameTimeText,
+    gameTimeText,
+    fieldName: game.field,
+    fieldText: game.field ? ` at ${game.field}` : '',
+    leagueName: game.leagueName,
+  };
+};
+
+const buildReminderItem = ({ setting, game, teamId, teamIds, scheduledFor, audience, route, fallbackMessage }) => {
+  const values = getTemplateValues(game, teamId);
+  const message = replaceTemplate(setting.message_template || fallbackMessage, values) || fallbackMessage;
+  const itemTeamIds = compact(teamIds || (teamId ? [teamId] : [game.awayTeamId, game.homeTeamId]));
+
+  return {
+    id: compact([setting.key, game.gameId, teamId || 'game']).join(':'),
+    category: setting.key,
+    eventId: game.gameId,
+    gameId: game.gameId,
+    teamId: teamId || null,
+    teamIds: itemTeamIds,
+    scheduledFor: scheduledFor.toISOString(),
+    title: setting.label || 'WYBSL Reminder',
+    message,
+    audience,
+    data: {
+      route,
+      gameId: game.gameId,
+      teamId: teamId || undefined,
+      teamIds: itemTeamIds,
+      date: game.date,
+      category: setting.key,
+    },
+    source: {
+      gameTitle: game.title,
+      gameDate: game.date,
+      gameTime: values.gameTimeText,
+      field: game.field,
+      leagueName: game.leagueName,
+      awayTeamId: game.awayTeamId,
+      homeTeamId: game.homeTeamId,
+    },
+  };
+};
+
+const buildPlanItemsForGame = (game, settingsByKey) => {
+  const items = [];
+
+  const gameReminder = getSetting(settingsByKey, 'game_24_hour_reminder');
+  if (gameReminder) {
+    const scheduledFor = addMinutes(game.startsAt, Number(gameReminder.offset_minutes || 0));
+    items.push(buildReminderItem({
+      setting: gameReminder,
+      game,
+      teamId: null,
+      scheduledFor,
+      audience: {
+        type: 'teams',
+        teamIds: [game.awayTeamId, game.homeTeamId],
+        recipientRoles: ['parent', 'coach'],
+      },
+      route: '/tabs/schedule',
+      fallbackMessage: `${game.title} is scheduled for ${formatEasternTime(game.startsAt)}${game.field ? ` at ${game.field}` : ''}.`,
+    }));
+  }
+
+  const lineupReminder = getSetting(settingsByKey, 'lineup_reminder');
+  if (lineupReminder) {
+    const teamIds = [game.awayTeamId, game.homeTeamId];
+    const scheduledFor = addMinutes(game.startsAt, Number(lineupReminder.offset_minutes || 0));
+    items.push(buildReminderItem({
+      setting: lineupReminder,
+      game,
+      teamId: null,
+      teamIds,
+      scheduledFor,
+      audience: {
+        type: 'teams',
+        teamIds,
+        recipientRoles: ['coach'],
+      },
+      route: '/tabs/setGameLineup',
+      fallbackMessage: `Reminder: set your lineup for ${game.title}.`,
+    }));
+  }
+
+  const scoreReminder = getSetting(settingsByKey, 'score_submission_reminder');
+  if (scoreReminder) {
+    const teamIds = [game.awayTeamId, game.homeTeamId];
+    const scheduledFor = addMinutes(game.startsAt, Number(scoreReminder.offset_minutes || 0));
+    items.push(buildReminderItem({
+      setting: scoreReminder,
+      game,
+      teamId: null,
+      teamIds,
+      scheduledFor,
+      audience: {
+        type: 'teams',
+        teamIds,
+        recipientRoles: ['coach'],
+      },
+      route: '/tabs/scorekeeping',
+      fallbackMessage: `Reminder: submit the score for ${game.title}.`,
+    }));
+  }
+
+  const attendanceReminder = getSetting(settingsByKey, 'attendance_reminder');
+  if (attendanceReminder) {
+    [game.awayTeamId, game.homeTeamId].forEach((teamId) => {
+      const scheduledFor = addMinutes(game.startsAt, Number(attendanceReminder.offset_minutes || 0));
+      items.push(buildReminderItem({
+        setting: attendanceReminder,
+        game,
+        teamId,
+        scheduledFor,
+        audience: {
+          type: 'teams',
+          teamIds: [teamId],
+          recipientRoles: ['parent'],
+        },
+        route: '/tabs/schedule',
+        fallbackMessage: `Please update attendance for ${game.title}.`,
+      }));
+    });
+  }
+
+  return items;
+};
+
+const groupPlannedWork = (items) =>
+  items.reduce((groups, item) => {
+    const key = item.category || 'unknown';
+    if (!groups[key]) {
+      groups[key] = [];
+    }
+    groups[key].push(item);
+    return groups;
+  }, {});
+
+const planDailyReminders = async ({ date, write, includePlannedWork }) => {
+  const settings = await listReminderSettings();
+  const settingsByKey = new Map(settings.map((setting) => [setting.key, setting]));
+  const fetchStart = addDaysToDateString(date, -1);
+  const fetchEnd = addDaysToDateString(date, 1);
+  const schedulePayload = await sourceApiGet('schedules', { start: fetchStart, end: fetchEnd });
+  const games = normalizeScheduleGames(schedulePayload);
+
+  const items = games
+    .flatMap((game) => buildPlanItemsForGame(game, settingsByKey))
+    .filter((item) => {
+      const scheduledFor = getPlanItemScheduledFor(item);
+      return scheduledFor && formatEasternDate(scheduledFor) === date;
+    })
+    .sort((a, b) => String(a.scheduledFor).localeCompare(String(b.scheduledFor)));
+
+  const redisKey = `${PLAN_KEY_PREFIX}:${date}`;
+  const plan = {
+    date,
+    createdAt: new Date().toISOString(),
+    fetchRange: {
+      start: fetchStart,
+      end: fetchEnd,
+    },
+    ttlSeconds: PLAN_TTL_SECONDS,
+    settings: settings.map((setting) => ({
+      key: setting.key,
+      enabled: setting.enabled,
+      offsetMinutes: setting.offset_minutes,
+    })),
+    sourceGameCount: games.length,
+    items,
+  };
+
+  if (write) {
+    await redisSet(redisKey, JSON.stringify(plan), PLAN_TTL_SECONDS);
+  }
+
+  const response = {
+    mode: 'plan',
+    write,
+    includePlannedWork,
+    redisKey,
+    redisStorageKey: withPrefix(redisKey),
+    ttlSeconds: PLAN_TTL_SECONDS,
+    date,
+    fetchRange: plan.fetchRange,
+    sourceGameCount: games.length,
+    plannedItemCount: items.length,
+    items,
+  };
+
+  if (includePlannedWork) {
+    response.plannedWork = groupPlannedWork(items);
+  }
+
+  return response;
+};
+
+const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
+  if (Number.isNaN(now.getTime())) {
+    const error = new Error('Invalid now value.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const pushEnabled = await getPushNotificationsEnabled();
+  const redisKey = `${PLAN_KEY_PREFIX}:${date}`;
+  const rawPlan = await redisGet(redisKey);
+  const plan = normalizePlan(rawPlan, date, redisKey);
+  const windowStart = addMinutes(now, -windowMinutes);
+  const windowEnd = now;
+
+  const dueCandidates = plan.items
+    .map((item) => ({ item, scheduledFor: getPlanItemScheduledFor(item) }))
+    .filter(({ scheduledFor }) => scheduledFor && scheduledFor > windowStart && scheduledFor <= windowEnd);
+
+  const results = [];
+  for (const { item, scheduledFor } of dueCandidates) {
+    const existingRun = await findExistingRun(item);
+    if (existingRun) {
+      results.push({
+        status: 'skipped_existing_run',
+        item,
+        scheduledFor: scheduledFor.toISOString(),
+        existingRun,
+      });
+      continue;
+    }
+
+    if (!pushEnabled) {
+      results.push({
+        status: dryRun ? 'would_skip_push_disabled' : 'skipped_push_disabled',
+        item,
+        scheduledFor: scheduledFor.toISOString(),
+      });
+      if (!dryRun) {
+        await insertRunRecord(item, 'skipped_push_disabled');
+      }
+      continue;
+    }
+
+    if (dryRun) {
+      results.push({
+        status: 'would_send',
+        item,
+        scheduledFor: scheduledFor.toISOString(),
+        payload: buildSendPushPayload(item),
+      });
+      continue;
+    }
+
+    try {
+      const sendResult = await postSupabaseFunction('send-push', buildSendPushPayload(item));
+      await insertRunRecord(item, 'sent', { sendResult });
+      results.push({
+        status: 'sent',
+        item,
+        scheduledFor: scheduledFor.toISOString(),
+        sendResult,
+      });
+    } catch (error) {
+      await insertRunRecord(item, 'failed', { error: error.message });
+      results.push({
+        status: 'failed',
+        item,
+        scheduledFor: scheduledFor.toISOString(),
+        error: error.message,
+      });
+    }
+  }
+
+  return {
+    mode: 'dispatch',
+    dryRun,
+    active: !dryRun,
+    pushEnabled,
+    date,
+    redisKey,
+    redisStorageKey: withPrefix(redisKey),
+    planFound: plan.found,
+    planCreatedAt: plan.createdAt,
+    totalPlannedItems: plan.items.length,
+    windowStart: windowStart.toISOString(),
+    windowEnd: windowEnd.toISOString(),
+    windowMinutes,
+    dueCount: dueCandidates.length,
+    results,
+  };
+};
+
+const getStatus = async ({ dryRun, now, windowMinutes }) => {
   const pushEnabled = await getPushNotificationsEnabled();
   const settings = await listReminderSettings();
   const windowStart = addMinutes(now, -windowMinutes);
@@ -136,7 +732,8 @@ const handlePushReminderWorker = async (req, res) => {
       messageTemplate: setting.message_template,
     }));
 
-  res.status(200).json({
+  return {
+    mode: 'status',
     dryRun,
     active: false,
     pushEnabled,
@@ -145,8 +742,35 @@ const handlePushReminderWorker = async (req, res) => {
     windowMinutes,
     enabledReminderTypes,
     plannedWork: [],
-    note: 'API worker scaffold only. It reads Supabase settings and computes the check window, but it does not resolve games or send pushes yet.',
-  });
+    note: 'Status mode only. Use mode=plan to build the Redis daily plan, then mode=dispatch to find due items.',
+  };
+};
+
+const handlePushReminderWorker = async (req, res) => {
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    res.status(405).json({ error: 'Method Not Allowed' });
+    return;
+  }
+
+  assertCronAllowed(req);
+
+  const options = await getRequestOptions(req);
+  if (options.mode === 'status') {
+    res.status(200).json(await getStatus(options));
+    return;
+  }
+
+  if (options.mode === 'plan') {
+    res.status(200).json(await planDailyReminders(options));
+    return;
+  }
+
+  if (options.mode !== 'dispatch') {
+    res.status(400).json({ error: `Unsupported mode: ${options.mode}`, supportedModes: ['status', 'plan', 'dispatch'] });
+    return;
+  }
+
+  res.status(200).json(await dispatchDueItems(options));
 };
 
 module.exports = { handlePushReminderWorker };
