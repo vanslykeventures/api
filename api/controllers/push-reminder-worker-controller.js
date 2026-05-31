@@ -3,13 +3,15 @@ const { createPushAudienceResolver } = require('../services/push-audience-servic
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const CRON_SECRET = process.env.PUSH_REMINDER_CRON_SECRET || '';
+const CRON_SECRET = process.env.CRON_SECRET || process.env.PUSH_REMINDER_CRON_SECRET || '';
 const SOURCE_BASE_URL = process.env.EWYBSL_SOURCE_BASE_URL || '';
 const SOURCE_API_KEY = process.env.EWYBSL_SOURCE_API_KEY || '';
 const SOURCE_TOKEN = process.env.EWYBSL_SOURCE_TOKEN || '';
 const PLAN_KEY_PREFIX = 'push:plans';
 const DEFAULT_WINDOW_MINUTES = 10;
 const PLAN_TTL_SECONDS = 2 * 24 * 60 * 60;
+const EARLIEST_SEND_TIME = process.env.PUSH_REMINDER_EARLIEST_SEND_TIME || '08:00';
+const LATEST_SEND_TIME = process.env.PUSH_REMINDER_LATEST_SEND_TIME || '21:30';
 
 const readRequestBody = (req) =>
   new Promise((resolve) => {
@@ -151,6 +153,12 @@ const parseNowOption = (value, date) => {
   return new Date(value);
 };
 
+const getEarliestSendForDate = (date) =>
+  easternWallTimeToDate(date, normalizeEasternClockTime(EARLIEST_SEND_TIME) || '08:00:00') || new Date('');
+
+const getLatestSendForDate = (date) =>
+  easternWallTimeToDate(date, normalizeEasternClockTime(LATEST_SEND_TIME) || '21:30:00') || new Date('');
+
 const extractTeamsFromInfo = (info) => {
   const value = typeof info === 'string' ? info : '';
   const [away, home] = value.split(/\s+@\s+/);
@@ -241,9 +249,14 @@ const listReminderSettings = async () => {
 
 const assertCronAllowed = (req) => {
   if (!CRON_SECRET) return;
-  const header = req.headers['x-cron-secret'];
-  const value = Array.isArray(header) ? header[0] : header;
-  if (value !== CRON_SECRET) {
+  const cronHeader = req.headers['x-cron-secret'];
+  const authHeader = req.headers.authorization;
+  const cronValue = Array.isArray(cronHeader) ? cronHeader[0] : cronHeader;
+  const authValue = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+  const bearerValue = typeof authValue === 'string' && authValue.toLowerCase().startsWith('bearer ')
+    ? authValue.slice(7).trim()
+    : '';
+  if (cronValue !== CRON_SECRET && bearerValue !== CRON_SECRET) {
     const error = new Error('Unauthorized cron request.');
     error.statusCode = 401;
     throw error;
@@ -403,6 +416,23 @@ const insertRunRecord = async (item, status, metadata = {}) => {
     }),
   });
 };
+
+const archivePlanRecord = async ({ date, redisKey, plan }) =>
+  supabaseRest('push_notification_plan_archives?on_conflict=plan_date', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=representation',
+    },
+    body: JSON.stringify({
+      plan_date: date,
+      redis_key: withPrefix(redisKey),
+      fetch_range: plan.fetchRange || {},
+      source_game_count: Number(plan.sourceGameCount || 0),
+      planned_item_count: Array.isArray(plan.items) ? plan.items.length : 0,
+      payload: plan,
+    }),
+  });
 
 const buildSendPushPayload = async (item, audienceResolver) => {
   const audienceResolution = await audienceResolver.resolveAudience(item.audience || { type: 'all' });
@@ -652,6 +682,7 @@ const planDailyReminders = async ({ date, write, includePlannedWork }) => {
 
   if (write) {
     await redisSet(redisKey, JSON.stringify(plan), PLAN_TTL_SECONDS);
+    await archivePlanRecord({ date, redisKey, plan });
   }
 
   const response = {
@@ -686,12 +717,27 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
   const redisKey = `${PLAN_KEY_PREFIX}:${date}`;
   const rawPlan = await redisGet(redisKey);
   const plan = normalizePlan(rawPlan, date, redisKey);
-  const windowStart = addMinutes(now, -windowMinutes);
+  const earliestSendForDate = getEarliestSendForDate(date);
+  const latestSendForDate = getLatestSendForDate(date);
+  const dispatchLockedUntilEarliest = now < earliestSendForDate;
+  const dispatchLockedAfterLatest = now > latestSendForDate;
+  const normalWindowStart = addMinutes(now, -windowMinutes);
+  const windowStart = dispatchLockedUntilEarliest
+    ? now
+    : normalWindowStart < earliestSendForDate
+      ? easternWallTimeToDate(date, '00:00:00') || normalWindowStart
+      : normalWindowStart;
   const windowEnd = now;
 
   const dueCandidates = plan.items
     .map((item) => ({ item, scheduledFor: getPlanItemScheduledFor(item) }))
-    .filter(({ scheduledFor }) => scheduledFor && scheduledFor > windowStart && scheduledFor <= windowEnd);
+    .filter(({ scheduledFor }) =>
+      scheduledFor &&
+      !dispatchLockedUntilEarliest &&
+      !dispatchLockedAfterLatest &&
+      scheduledFor > windowStart &&
+      scheduledFor <= windowEnd
+    );
   const dispatchCandidates = dryRun
     ? plan.items
       .map((item) => ({ item, scheduledFor: getPlanItemScheduledFor(item) }))
@@ -794,6 +840,10 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
     planFound: plan.found,
     planCreatedAt: plan.createdAt,
     totalPlannedItems: plan.items.length,
+    earliestSendTime: formatEasternTime(earliestSendForDate),
+    latestSendTime: formatEasternTime(latestSendForDate),
+    dispatchLockedUntilEarliest,
+    dispatchLockedAfterLatest,
     windowStart: formatEasternDateTime(windowStart),
     windowEnd: formatEasternDateTime(windowEnd),
     windowMinutes,
