@@ -1,10 +1,12 @@
 const { redisGet, redisSet, withPrefix } = require('./redis-controller');
+const { createPushAudienceResolver } = require('../services/push-audience-service');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const CRON_SECRET = process.env.PUSH_REMINDER_CRON_SECRET || '';
 const SOURCE_BASE_URL = process.env.EWYBSL_SOURCE_BASE_URL || '';
 const SOURCE_API_KEY = process.env.EWYBSL_SOURCE_API_KEY || '';
+const SOURCE_TOKEN = process.env.EWYBSL_SOURCE_TOKEN || '';
 const PLAN_KEY_PREFIX = 'push:plans';
 const DEFAULT_WINDOW_MINUTES = 10;
 const PLAN_TTL_SECONDS = 2 * 24 * 60 * 60;
@@ -116,6 +118,39 @@ const formatEasternTime = (date) =>
     minute: '2-digit',
   }).format(date);
 
+const formatEasternDateTime = (date) => `${formatEasternDate(date)} ${formatEasternTime(date)} ET`;
+
+const normalizeEasternClockTime = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const match = raw.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!match) return null;
+
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || 0);
+  const meridiem = match[3]?.toLowerCase();
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || minute < 0 || minute > 59) return null;
+
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null;
+    if (meridiem === 'pm' && hour !== 12) hour += 12;
+    if (meridiem === 'am' && hour === 12) hour = 0;
+  } else if (hour < 0 || hour > 23) {
+    return null;
+  }
+
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+};
+
+const parseNowOption = (value, date) => {
+  if (value === undefined || value === null || value === '') return new Date();
+  const easternClockTime = normalizeEasternClockTime(value);
+  if (easternClockTime) {
+    return easternWallTimeToDate(date, easternClockTime) || new Date('');
+  }
+  return new Date(value);
+};
+
 const extractTeamsFromInfo = (info) => {
   const value = typeof info === 'string' ? info : '';
   const [away, home] = value.split(/\s+@\s+/);
@@ -158,6 +193,7 @@ const sourceApiGet = async (path, params = {}) => {
     method: 'GET',
     headers: {
       Accept: 'application/json',
+      ...(SOURCE_TOKEN ? { Token: SOURCE_TOKEN } : {}),
     },
   });
   const text = await response.text();
@@ -219,24 +255,33 @@ const readQueryParam = (req, key) => {
   return url.searchParams.get(key) || '';
 };
 
+const readFirstDefined = (...values) => values.find((value) => value !== undefined && value !== null && value !== '');
+
+const parseBooleanOption = (value, defaultValue) => {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const normalized = String(value).trim().toLowerCase();
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  return defaultValue;
+};
+
 const getRequestOptions = async (req) => {
   const body = req.method === 'POST' ? await parseRequestBody(req) : {};
   const queryMode = readQueryParam(req, 'mode');
   const queryDate = readQueryParam(req, 'date');
-  const queryDryRun = readQueryParam(req, 'dryRun');
+  const queryDryRun = readFirstDefined(readQueryParam(req, 'dryRun'), readQueryParam(req, 'dry_run'));
   const queryWrite = readQueryParam(req, 'write');
   const queryIncludePlannedWork = readQueryParam(req, 'includePlannedWork');
   const queryWindowMinutes = readQueryParam(req, 'windowMinutes');
   const queryNow = readQueryParam(req, 'now');
 
-  const now = body.now || queryNow ? new Date(body.now || queryNow) : new Date();
+  const date = body.date || queryDate || formatEasternDate(new Date());
+  const now = parseNowOption(readFirstDefined(body.now, queryNow), date);
   const windowMinutesValue = body.windowMinutes ?? (queryWindowMinutes ? Number(queryWindowMinutes) : undefined);
   const windowMinutes = Number.isFinite(windowMinutesValue) ? Number(windowMinutesValue) : DEFAULT_WINDOW_MINUTES;
-  const dryRun = body.dryRun !== undefined
-    ? body.dryRun !== false
-    : queryDryRun
-      ? queryDryRun !== 'false'
-      : true;
+  const dryRun = parseBooleanOption(readFirstDefined(body.dryRun, body.dry_run, queryDryRun), true);
   const write = body.write !== undefined
     ? body.write === true
     : queryWrite
@@ -250,7 +295,7 @@ const getRequestOptions = async (req) => {
 
   return {
     mode: body.mode || queryMode || 'dispatch',
-    date: body.date || queryDate || formatEasternDate(now),
+    date,
     dryRun,
     write,
     includePlannedWork,
@@ -359,16 +404,21 @@ const insertRunRecord = async (item, status, metadata = {}) => {
   });
 };
 
-const buildSendPushPayload = (item) => ({
-  title: item.title || 'WYBSL',
-  body: item.message || item.body || '',
-  message: item.message || item.body || '',
-  category: item.category || 'scheduled_reminder',
-  // TODO: Before enabling live dispatch, resolve team/role audiences into parent_ids
-  // from the source API so send-push can match rows in push_tokens.
-  audience: item.audience || { type: 'all' },
-  data: item.data || {},
-});
+const buildSendPushPayload = async (item, audienceResolver) => {
+  const audienceResolution = await audienceResolver.resolveAudience(item.audience || { type: 'all' });
+
+  return {
+    payload: {
+      title: item.title || 'WYBSL',
+      body: item.message || item.body || '',
+      message: item.message || item.body || '',
+      category: item.category || 'scheduled_reminder',
+      audience: audienceResolution.audience,
+      data: item.data || {},
+    },
+    audienceResolution: audienceResolution.resolution,
+  };
+};
 
 const getSetting = (settingsByKey, key) => {
   const setting = settingsByKey.get(key);
@@ -642,15 +692,24 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
   const dueCandidates = plan.items
     .map((item) => ({ item, scheduledFor: getPlanItemScheduledFor(item) }))
     .filter(({ scheduledFor }) => scheduledFor && scheduledFor > windowStart && scheduledFor <= windowEnd);
+  const dispatchCandidates = dryRun
+    ? plan.items
+      .map((item) => ({ item, scheduledFor: getPlanItemScheduledFor(item) }))
+      .filter(({ scheduledFor }) => Boolean(scheduledFor))
+    : dueCandidates;
 
   const results = [];
-  for (const { item, scheduledFor } of dueCandidates) {
+  const audienceResolver = createPushAudienceResolver({ sourceApiGet });
+  for (const { item, scheduledFor } of dispatchCandidates) {
+    const inWindow = scheduledFor > windowStart && scheduledFor <= windowEnd;
+
     const existingRun = await findExistingRun(item);
     if (existingRun) {
       results.push({
         status: 'skipped_existing_run',
         item,
-        scheduledFor: scheduledFor.toISOString(),
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
         existingRun,
       });
       continue;
@@ -660,7 +719,8 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
       results.push({
         status: dryRun ? 'would_skip_push_disabled' : 'skipped_push_disabled',
         item,
-        scheduledFor: scheduledFor.toISOString(),
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
       });
       if (!dryRun) {
         await insertRunRecord(item, 'skipped_push_disabled');
@@ -668,31 +728,56 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
       continue;
     }
 
+    let payloadResult;
+    try {
+      payloadResult = await buildSendPushPayload(item, audienceResolver);
+    } catch (error) {
+      results.push({
+        status: dryRun ? 'would_fail_audience_resolution' : 'failed_audience_resolution',
+        item,
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
+        error: error.message,
+      });
+      if (!dryRun) {
+        await insertRunRecord(item, 'failed_audience_resolution', { error: error.message });
+      }
+      continue;
+    }
+
     if (dryRun) {
       results.push({
-        status: 'would_send',
+        status: inWindow ? 'would_send' : 'would_not_send_outside_window',
         item,
-        scheduledFor: scheduledFor.toISOString(),
-        payload: buildSendPushPayload(item),
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
+        payload: payloadResult.payload,
+        audienceResolution: payloadResult.audienceResolution,
       });
       continue;
     }
 
     try {
-      const sendResult = await postSupabaseFunction('send-push', buildSendPushPayload(item));
-      await insertRunRecord(item, 'sent', { sendResult });
+      const sendResult = await postSupabaseFunction('send-push', payloadResult.payload);
+      await insertRunRecord(item, 'sent', {
+        sendResult,
+        audienceResolution: payloadResult.audienceResolution,
+      });
       results.push({
         status: 'sent',
         item,
-        scheduledFor: scheduledFor.toISOString(),
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
         sendResult,
+        audienceResolution: payloadResult.audienceResolution,
       });
     } catch (error) {
       await insertRunRecord(item, 'failed', { error: error.message });
       results.push({
         status: 'failed',
         item,
-        scheduledFor: scheduledFor.toISOString(),
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
         error: error.message,
       });
     }
@@ -709,10 +794,11 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
     planFound: plan.found,
     planCreatedAt: plan.createdAt,
     totalPlannedItems: plan.items.length,
-    windowStart: windowStart.toISOString(),
-    windowEnd: windowEnd.toISOString(),
+    windowStart: formatEasternDateTime(windowStart),
+    windowEnd: formatEasternDateTime(windowEnd),
     windowMinutes,
     dueCount: dueCandidates.length,
+    resultCount: results.length,
     results,
   };
 };
@@ -737,8 +823,8 @@ const getStatus = async ({ dryRun, now, windowMinutes }) => {
     dryRun,
     active: false,
     pushEnabled,
-    windowStart: windowStart.toISOString(),
-    windowEnd: windowEnd.toISOString(),
+    windowStart: formatEasternDateTime(windowStart),
+    windowEnd: formatEasternDateTime(windowEnd),
     windowMinutes,
     enabledReminderTypes,
     plannedWork: [],
