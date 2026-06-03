@@ -6,11 +6,11 @@
   },
   "crons": [
     {
-      "path": "/api/push-reminders?mode=plan&write=true",
+      "path": "/api/push-reminders-plan",
       "schedule": "5 4,5 * * *"
     },
     {
-      "path": "/api/push-reminders?mode=dispatch&dryRun=false&windowMinutes=15",
+      "path": "/api/push-reminders-dispatch",
       "schedule": "*/15 * * * *"
     }
   ],
