@@ -4,6 +4,16 @@
       "includeFiles": "files/**"
     }
   },
+  "crons": [
+    {
+      "path": "/api/push-reminders?mode=plan&write=true",
+      "schedule": "5 4,5 * * *"
+    },
+    {
+      "path": "/api/push-reminders?mode=dispatch&dryRun=false&windowMinutes=15",
+      "schedule": "*/15 * * * *"
+    }
+  ],
   "rewrites": [
     {
       "source": "/api/external/:path*",
