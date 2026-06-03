@@ -71,7 +71,7 @@ It returns:
 - `EWYBSL_SOURCE_TOKEN` (required for `/api/push-reminders` audience resolution against protected team/player/coach endpoints)
 - `SUPABASE_URL` (required for `/api/push-reminders`)
 - `SUPABASE_SERVICE_ROLE_KEY` (required for `/api/push-reminders`)
-- `CRON_SECRET` (optional, used by Vercel Cron as `Authorization: Bearer <secret>`; `PUSH_REMINDER_CRON_SECRET` is still accepted as a fallback)
+- `CRON_SECRET` (optional, used by Vercel Crons as `Authorization: Bearer <secret>`; `PUSH_REMINDER_CRON_SECRET` is still accepted as a fallback)
 - `PUSH_REMINDER_EARLIEST_SEND_TIME` (optional, default: `08:00`; Eastern clock time for earliest live reminder dispatch)
 - `PUSH_REMINDER_LATEST_SEND_TIME` (optional, default: `21:30`; Eastern clock time for latest live reminder dispatch)
 
