@@ -3,6 +3,7 @@ const { createPushAudienceResolver } = require('../services/push-audience-servic
 
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SUPABASE_FUNCTION_KEY = process.env.SUPABASE_FUNCTION_KEY || process.env.SUPABASE_ANON_KEY || process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || SUPABASE_SERVICE_ROLE_KEY;
 const CRON_SECRET = process.env.CRON_SECRET || process.env.PUSH_REMINDER_CRON_SECRET || '';
 const SOURCE_BASE_URL = process.env.EWYBSL_SOURCE_BASE_URL || '';
 const SOURCE_API_KEY = process.env.EWYBSL_SOURCE_API_KEY || '';
@@ -218,7 +219,7 @@ const supabaseRest = async (path, init = {}) => {
     ...init,
     headers: {
       apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      Authorization: `Bearer ` + SUPABASE_SERVICE_ROLE_KEY,
       Accept: 'application/json',
       ...(init.headers || {}),
     },
@@ -289,6 +290,14 @@ const getRequestOptions = async (req) => {
   const queryIncludePlannedWork = readQueryParam(req, 'includePlannedWork');
   const queryWindowMinutes = readQueryParam(req, 'windowMinutes');
   const queryNow = readQueryParam(req, 'now');
+  const queryIgnoreSendWindow = readFirstDefined(
+    readQueryParam(req, 'ignoreSendWindow'),
+    readQueryParam(req, 'ignore_send_window')
+  );
+  const queryTestTeamId = readFirstDefined(
+    readQueryParam(req, 'testTeamId'),
+    readQueryParam(req, 'test_team_id')
+  );
 
   const date = body.date || queryDate || formatEasternDate(new Date());
   const now = parseNowOption(readFirstDefined(body.now, queryNow), date);
@@ -314,6 +323,11 @@ const getRequestOptions = async (req) => {
     includePlannedWork,
     now,
     windowMinutes,
+    ignoreSendWindow: parseBooleanOption(
+      readFirstDefined(body.ignoreSendWindow, body.ignore_send_window, queryIgnoreSendWindow),
+      false
+    ),
+    testTeamId: readFirstDefined(body.testTeamId, body.test_team_id, queryTestTeamId) || null,
   };
 };
 
@@ -352,6 +366,75 @@ const getPlanItemIdentity = (item) => ({
   teamId: item.teamId ?? item.team_id ?? null,
 });
 
+const asArray = (value) => {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null || value === '') return [];
+  return [value];
+};
+
+const uniqueStrings = (values) =>
+  Array.from(new Set(values.flatMap(asArray).map((value) => String(value)).filter(Boolean)));
+
+const getPlanItemTeamIds = (item) => {
+  const explicitTeamIds = uniqueStrings([
+    item.teamId,
+    item.team_id,
+    item.teamIds,
+    item.team_ids,
+    item.audience?.teamId,
+    item.audience?.team_id,
+    item.audience?.teamIds,
+    item.audience?.team_ids,
+  ]);
+
+  if (explicitTeamIds.length > 0) {
+    return explicitTeamIds;
+  }
+
+  return uniqueStrings([
+    item.source?.awayTeamId,
+    item.source?.homeTeamId,
+  ]);
+};
+
+const buildTestTeamDispatchItem = (item, testTeamId) => {
+  if (!testTeamId) return item;
+
+  const normalizedTestTeamId = String(testTeamId);
+  const itemTeamIds = getPlanItemTeamIds(item);
+  if (!itemTeamIds.includes(normalizedTestTeamId)) {
+    return null;
+  }
+
+  const originalAudience = item.audience && typeof item.audience === 'object'
+    ? item.audience
+    : {};
+  const recipientRoles = originalAudience.recipientRoles ?? originalAudience.recipient_roles ?? ['parent', 'coach'];
+
+  return {
+    ...item,
+    teamId: normalizedTestTeamId,
+    teamIds: [normalizedTestTeamId],
+    audience: {
+      ...originalAudience,
+      type: 'teams',
+      teamIds: [normalizedTestTeamId],
+      recipientRoles,
+    },
+    data: {
+      ...(item.data || {}),
+      teamId: normalizedTestTeamId,
+      teamIds: [normalizedTestTeamId],
+      testTeamId: normalizedTestTeamId,
+    },
+    testMode: {
+      enabled: true,
+      teamId: normalizedTestTeamId,
+      originalTeamIds: itemTeamIds,
+    },
+  };
+};
+
 const encodeEq = (value) => `eq.${encodeURIComponent(String(value))}`;
 
 const findExistingRun = async (item) => {
@@ -359,7 +442,7 @@ const findExistingRun = async (item) => {
   if (!category) return null;
 
   const params = [
-    'select=id,category,event_id,team_id,sent_at',
+    'select=id,category,event_id,team_id,sent_at,metadata',
     `category=${encodeEq(category)}`,
     eventId === null || eventId === undefined
       ? 'event_id=is.null'
@@ -378,8 +461,7 @@ const postSupabaseFunction = async (functionName, payload) => {
   const response = await fetch(`${SUPABASE_URL.replace(/\/+$/, '')}/functions/v1/${functionName}`, {
     method: 'POST',
     headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      apikey: SUPABASE_FUNCTION_KEY,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
@@ -393,27 +475,41 @@ const postSupabaseFunction = async (functionName, payload) => {
   return parsed;
 };
 
-const insertRunRecord = async (item, status, metadata = {}) => {
+const insertRunRecord = async (item, status, metadata = {}, existingRun = null) => {
   const { category, eventId, teamId } = getPlanItemIdentity(item);
   if (!category) return null;
 
   const scheduledFor = getPlanItemScheduledFor(item);
+  const body = JSON.stringify({
+    category,
+    event_id: eventId === null || eventId === undefined ? null : String(eventId),
+    team_id: teamId === null || teamId === undefined ? null : String(teamId),
+    scheduled_for: scheduledFor ? scheduledFor.toISOString() : null,
+    sent_at: new Date().toISOString(),
+    metadata: {
+      ...metadata,
+      status,
+    },
+  });
+
+  if (existingRun?.id) {
+    return supabaseRest(`push_notification_runs?id=eq.${encodeURIComponent(String(existingRun.id))}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Prefer: 'return=representation',
+      },
+      body,
+    });
+  }
+
   return supabaseRest('push_notification_runs', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Prefer: 'return=representation',
     },
-    body: JSON.stringify({
-      category,
-      event_id: eventId === null || eventId === undefined ? null : String(eventId),
-      team_id: teamId === null || teamId === undefined ? null : String(teamId),
-      scheduled_for: scheduledFor ? scheduledFor.toISOString() : null,
-      metadata: {
-        ...metadata,
-        status,
-      },
-    }),
+    body,
   });
 };
 
@@ -706,7 +802,7 @@ const planDailyReminders = async ({ date, write, includePlannedWork }) => {
   return response;
 };
 
-const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
+const dispatchDueItems = async ({ date, dryRun, now, windowMinutes, ignoreSendWindow, testTeamId }) => {
   if (Number.isNaN(now.getTime())) {
     const error = new Error('Invalid now value.');
     error.statusCode = 400;
@@ -719,12 +815,12 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
   const plan = normalizePlan(rawPlan, date, redisKey);
   const earliestSendForDate = getEarliestSendForDate(date);
   const latestSendForDate = getLatestSendForDate(date);
-  const dispatchLockedUntilEarliest = now < earliestSendForDate;
-  const dispatchLockedAfterLatest = now > latestSendForDate;
+  const dispatchLockedUntilEarliest = !ignoreSendWindow && now < earliestSendForDate;
+  const dispatchLockedAfterLatest = !ignoreSendWindow && now > latestSendForDate;
   const normalWindowStart = addMinutes(now, -windowMinutes);
   const windowStart = dispatchLockedUntilEarliest
     ? now
-    : normalWindowStart < earliestSendForDate
+    : !ignoreSendWindow && normalWindowStart < earliestSendForDate
       ? easternWallTimeToDate(date, '00:00:00') || normalWindowStart
       : normalWindowStart;
   const windowEnd = now;
@@ -745,15 +841,32 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
     : dueCandidates;
 
   const results = [];
+  const dispatchedTestItemKeys = new Set();
   const audienceResolver = createPushAudienceResolver({ sourceApiGet });
   for (const { item, scheduledFor } of dispatchCandidates) {
     const inWindow = scheduledFor > windowStart && scheduledFor <= windowEnd;
+    const dispatchItem = buildTestTeamDispatchItem(item, testTeamId);
 
-    const existingRun = await findExistingRun(item);
-    if (existingRun) {
+    if (!dispatchItem) {
+      continue;
+    }
+
+    if (testTeamId) {
+      const { category, eventId, teamId } = getPlanItemIdentity(dispatchItem);
+      const testItemKey = [category, eventId, teamId].map((value) => String(value ?? '')).join(':');
+      if (dispatchedTestItemKeys.has(testItemKey)) {
+        continue;
+      }
+      dispatchedTestItemKeys.add(testItemKey);
+    }
+
+    const existingRun = testTeamId ? null : await findExistingRun(dispatchItem);
+    const existingRunStatus = existingRun?.metadata?.status;
+    const canRetryExistingRun = ['failed', 'failed_audience_resolution'].includes(existingRunStatus);
+    if (existingRun && !canRetryExistingRun) {
       results.push({
         status: 'skipped_existing_run',
-        item,
+        item: dispatchItem,
         scheduledFor: formatEasternDateTime(scheduledFor),
         inWindow,
         existingRun,
@@ -764,29 +877,31 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
     if (!pushEnabled) {
       results.push({
         status: dryRun ? 'would_skip_push_disabled' : 'skipped_push_disabled',
-        item,
+        item: dispatchItem,
         scheduledFor: formatEasternDateTime(scheduledFor),
         inWindow,
+        testTeamId,
       });
-      if (!dryRun) {
-        await insertRunRecord(item, 'skipped_push_disabled');
+      if (!dryRun && !testTeamId) {
+        await insertRunRecord(dispatchItem, 'skipped_push_disabled', {}, existingRun);
       }
       continue;
     }
 
     let payloadResult;
     try {
-      payloadResult = await buildSendPushPayload(item, audienceResolver);
+      payloadResult = await buildSendPushPayload(dispatchItem, audienceResolver);
     } catch (error) {
       results.push({
         status: dryRun ? 'would_fail_audience_resolution' : 'failed_audience_resolution',
-        item,
+        item: dispatchItem,
         scheduledFor: formatEasternDateTime(scheduledFor),
         inWindow,
+        testTeamId,
         error: error.message,
       });
-      if (!dryRun) {
-        await insertRunRecord(item, 'failed_audience_resolution', { error: error.message });
+      if (!dryRun && !testTeamId) {
+        await insertRunRecord(dispatchItem, 'failed_audience_resolution', { error: error.message }, existingRun);
       }
       continue;
     }
@@ -794,9 +909,10 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
     if (dryRun) {
       results.push({
         status: inWindow ? 'would_send' : 'would_not_send_outside_window',
-        item,
+        item: dispatchItem,
         scheduledFor: formatEasternDateTime(scheduledFor),
         inWindow,
+        testTeamId,
         payload: payloadResult.payload,
         audienceResolution: payloadResult.audienceResolution,
       });
@@ -805,25 +921,31 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
 
     try {
       const sendResult = await postSupabaseFunction('send-push', payloadResult.payload);
-      await insertRunRecord(item, 'sent', {
-        sendResult,
-        audienceResolution: payloadResult.audienceResolution,
-      });
+      if (!testTeamId) {
+        await insertRunRecord(dispatchItem, 'sent', {
+          sendResult,
+          audienceResolution: payloadResult.audienceResolution,
+        }, existingRun);
+      }
       results.push({
-        status: 'sent',
-        item,
+        status: testTeamId ? 'sent_test_team' : 'sent',
+        item: dispatchItem,
         scheduledFor: formatEasternDateTime(scheduledFor),
         inWindow,
+        testTeamId,
         sendResult,
         audienceResolution: payloadResult.audienceResolution,
       });
     } catch (error) {
-      await insertRunRecord(item, 'failed', { error: error.message });
+      if (!testTeamId) {
+        await insertRunRecord(dispatchItem, 'failed', { error: error.message }, existingRun);
+      }
       results.push({
-        status: 'failed',
-        item,
+        status: testTeamId ? 'failed_test_team' : 'failed',
+        item: dispatchItem,
         scheduledFor: formatEasternDateTime(scheduledFor),
         inWindow,
+        testTeamId,
         error: error.message,
       });
     }
@@ -833,6 +955,9 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes }) => {
     mode: 'dispatch',
     dryRun,
     active: !dryRun,
+    ignoreSendWindow,
+    testMode: Boolean(testTeamId),
+    testTeamId: testTeamId || null,
     pushEnabled,
     date,
     redisKey,
