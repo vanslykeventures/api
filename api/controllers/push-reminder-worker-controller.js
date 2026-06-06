@@ -169,6 +169,28 @@ const extractTeamsFromInfo = (info) => {
   };
 };
 
+const isCanceledScheduleItem = (item) => {
+  const statusText = [
+    item.status,
+    item.status_name,
+    item.event_status,
+    item.game_status,
+    item.state,
+  ]
+    .map((value) => String(value || '').toLowerCase())
+    .join(' ');
+
+  return Boolean(
+    item.cancelled ||
+    item.canceled ||
+    item.is_cancelled ||
+    item.is_canceled ||
+    item.cancelled_at ||
+    item.canceled_at ||
+    /\b(cancelled|canceled|postponed|rescheduled)\b/.test(statusText)
+  );
+};
+
 const compact = (values) => values.filter((value) => value !== null && value !== undefined && value !== '');
 
 const replaceTemplate = (template, values) =>
@@ -546,6 +568,183 @@ const buildSendPushPayload = async (item, audienceResolver) => {
   };
 };
 
+const normalizeComparableText = (value) => String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+
+const getResolvedRecipientCount = (payloadResult) => {
+  const audience = payloadResult?.payload?.audience;
+  if (audience?.type === 'parent_ids') {
+    return Array.isArray(audience.parentIds) ? audience.parentIds.length : 0;
+  }
+
+  const count = payloadResult?.audienceResolution?.resolvedParentIdCount;
+  return typeof count === 'number' ? count : null;
+};
+
+const getPayloadParentIds = (payloadResult) => {
+  const audience = payloadResult?.payload?.audience;
+  if (audience?.type !== 'parent_ids') return null;
+  return uniqueStrings(audience.parentIds ?? audience.parent_ids ?? []);
+};
+
+const resolveActivePushRecipients = async (payloadResult) => {
+  const parentIds = getPayloadParentIds(payloadResult);
+  if (!parentIds) {
+    return {
+      parentIdCount: null,
+      activeParentIdCount: null,
+      pushTokenCount: null,
+    };
+  }
+
+  const numericParentIds = Array.from(new Set(
+    parentIds
+      .map((parentId) => Number.parseInt(String(parentId), 10))
+      .filter((parentId) => Number.isFinite(parentId))
+  ));
+
+  if (numericParentIds.length === 0) {
+    return {
+      parentIdCount: parentIds.length,
+      activeParentIdCount: 0,
+      pushTokenCount: 0,
+      activeParentIds: [],
+    };
+  }
+
+  const idFilter = numericParentIds.map((parentId) => encodeURIComponent(String(parentId))).join(',');
+  const rows = await supabaseRest(
+    `push_tokens?select=user_id,user_name,expo_push_token&user_id=in.(${idFilter})&expo_push_token=not.is.null`
+  );
+  const activeParentIds = uniqueStrings((Array.isArray(rows) ? rows : []).map((row) => row.user_id));
+  const activeParents = activeParentIds.map((parentId) => {
+    const matchingRow = (Array.isArray(rows) ? rows : []).find((row) => String(row.user_id) === parentId);
+    return {
+      parentId,
+      userName: matchingRow?.user_name || null,
+    };
+  });
+
+  return {
+    parentIdCount: parentIds.length,
+    activeParentIdCount: activeParentIds.length,
+    pushTokenCount: Array.isArray(rows) ? rows.length : 0,
+    activeParentIds,
+    activeParents,
+  };
+};
+
+const validatePlannedGameAgainstCurrentSchedule = (item, currentGame) => {
+  const source = item.source || {};
+  if (!item.gameId && !item.game_id && !item.eventId && !item.event_id) {
+    return { valid: true };
+  }
+
+  if (!currentGame) {
+    return {
+      valid: false,
+      reason: 'game_not_found',
+      message: 'Game no longer appears in the current schedule.',
+    };
+  }
+
+  const expectedStartsAt = source.startsAt ? new Date(source.startsAt) : null;
+  const currentStartsAt = currentGame.startsAt;
+  if (
+    expectedStartsAt &&
+    !Number.isNaN(expectedStartsAt.getTime()) &&
+    currentStartsAt &&
+    expectedStartsAt.getTime() !== currentStartsAt.getTime()
+  ) {
+    return {
+      valid: false,
+      reason: 'game_time_changed',
+      message: 'Game time changed after this push was planned.',
+      expected: expectedStartsAt.toISOString(),
+      current: currentStartsAt.toISOString(),
+    };
+  }
+
+  if (source.gameDate && source.gameDate !== currentGame.date) {
+    return {
+      valid: false,
+      reason: 'game_date_changed',
+      message: 'Game date changed after this push was planned.',
+      expected: source.gameDate,
+      current: currentGame.date,
+    };
+  }
+
+  if (source.gameTime && source.gameTime !== formatEasternTime(currentGame.startsAt)) {
+    return {
+      valid: false,
+      reason: 'game_time_changed',
+      message: 'Game time changed after this push was planned.',
+      expected: source.gameTime,
+      current: formatEasternTime(currentGame.startsAt),
+    };
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(source, 'field') &&
+    normalizeComparableText(source.field) !== normalizeComparableText(currentGame.field)
+  ) {
+    return {
+      valid: false,
+      reason: 'game_field_changed',
+      message: 'Game field changed after this push was planned.',
+      expected: source.field,
+      current: currentGame.field,
+    };
+  }
+
+  if (source.awayTeamId && source.awayTeamId !== currentGame.awayTeamId) {
+    return {
+      valid: false,
+      reason: 'away_team_changed',
+      message: 'Away team changed after this push was planned.',
+      expected: source.awayTeamId,
+      current: currentGame.awayTeamId,
+    };
+  }
+
+  if (source.homeTeamId && source.homeTeamId !== currentGame.homeTeamId) {
+    return {
+      valid: false,
+      reason: 'home_team_changed',
+      message: 'Home team changed after this push was planned.',
+      expected: source.homeTeamId,
+      current: currentGame.homeTeamId,
+    };
+  }
+
+  return { valid: true };
+};
+
+const createCurrentGameValidator = ({ date }) => {
+  let gamesByIdPromise = null;
+
+  const getGamesById = async () => {
+    if (!gamesByIdPromise) {
+      const schedulePayload = await sourceApiGet('schedules', {
+        start: addDaysToDateString(date, -2),
+        end: addDaysToDateString(date, 2),
+      });
+      gamesByIdPromise = Promise.resolve(new Map(
+        normalizeScheduleGames(schedulePayload).map((game) => [game.gameId, game])
+      ));
+    }
+
+    return gamesByIdPromise;
+  };
+
+  return async (item) => {
+    const gameId = item.gameId ?? item.game_id ?? item.eventId ?? item.event_id;
+    if (!gameId) return { valid: true };
+    const gamesById = await getGamesById();
+    return validatePlannedGameAgainstCurrentSchedule(item, gamesById.get(String(gameId)));
+  };
+};
+
 const getSetting = (settingsByKey, key) => {
   const setting = settingsByKey.get(key);
   if (!setting || !setting.enabled) return null;
@@ -561,6 +760,7 @@ const normalizeScheduleGames = (schedulePayload) => {
 
   return rows
     .filter((item) => (item.type ?? '').toLowerCase() === 'game')
+    .filter((item) => !isCanceledScheduleItem(item))
     .map((item) => {
       const gameId = item.game_id ?? item.event_id ?? item.id;
       const date = item.date;
@@ -644,6 +844,7 @@ const buildReminderItem = ({ setting, game, teamId, teamIds, scheduledFor, audie
       leagueName: game.leagueName,
       awayTeamId: game.awayTeamId,
       homeTeamId: game.homeTeamId,
+      startsAt: game.startsAt.toISOString(),
     },
   };
 };
@@ -843,6 +1044,7 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes, ignoreSendWi
   const results = [];
   const dispatchedTestItemKeys = new Set();
   const audienceResolver = createPushAudienceResolver({ sourceApiGet });
+  const validateCurrentGame = createCurrentGameValidator({ date });
   for (const { item, scheduledFor } of dispatchCandidates) {
     const inWindow = scheduledFor > windowStart && scheduledFor <= windowEnd;
     const dispatchItem = buildTestTeamDispatchItem(item, testTeamId);
@@ -871,6 +1073,41 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes, ignoreSendWi
         inWindow,
         existingRun,
       });
+      continue;
+    }
+
+    let currentGameValidation;
+    try {
+      currentGameValidation = await validateCurrentGame(dispatchItem);
+    } catch (error) {
+      results.push({
+        status: dryRun ? 'would_fail_current_game_validation' : 'failed_current_game_validation',
+        item: dispatchItem,
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
+        testTeamId,
+        error: error.message,
+      });
+      if (!dryRun && !testTeamId) {
+        await insertRunRecord(dispatchItem, 'failed_current_game_validation', { error: error.message }, existingRun);
+      }
+      continue;
+    }
+
+    if (!currentGameValidation.valid) {
+      results.push({
+        status: dryRun ? 'would_skip_game_changed' : 'skipped_game_changed',
+        item: dispatchItem,
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
+        testTeamId,
+        gameValidation: currentGameValidation,
+      });
+      if (!dryRun && !testTeamId) {
+        await insertRunRecord(dispatchItem, 'skipped_game_changed', {
+          gameValidation: currentGameValidation,
+        }, existingRun);
+      }
       continue;
     }
 
@@ -906,6 +1143,63 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes, ignoreSendWi
       continue;
     }
 
+    const recipientCount = getResolvedRecipientCount(payloadResult);
+    if (recipientCount === 0) {
+      results.push({
+        status: dryRun ? 'would_skip_empty_audience' : 'skipped_empty_audience',
+        item: dispatchItem,
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
+        testTeamId,
+        payload: payloadResult.payload,
+        audienceResolution: payloadResult.audienceResolution,
+      });
+      if (!dryRun && !testTeamId) {
+        await insertRunRecord(dispatchItem, 'skipped_empty_audience', {
+          audienceResolution: payloadResult.audienceResolution,
+        }, existingRun);
+      }
+      continue;
+    }
+
+    let activePushRecipients;
+    try {
+      activePushRecipients = await resolveActivePushRecipients(payloadResult);
+    } catch (error) {
+      results.push({
+        status: dryRun ? 'would_fail_active_recipient_resolution' : 'failed_active_recipient_resolution',
+        item: dispatchItem,
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
+        testTeamId,
+        error: error.message,
+      });
+      if (!dryRun && !testTeamId) {
+        await insertRunRecord(dispatchItem, 'failed_active_recipient_resolution', { error: error.message }, existingRun);
+      }
+      continue;
+    }
+
+    if (activePushRecipients.activeParentIdCount === 0 || activePushRecipients.pushTokenCount === 0) {
+      results.push({
+        status: dryRun ? 'would_skip_no_active_recipients' : 'skipped_no_active_recipients',
+        item: dispatchItem,
+        scheduledFor: formatEasternDateTime(scheduledFor),
+        inWindow,
+        testTeamId,
+        payload: payloadResult.payload,
+        audienceResolution: payloadResult.audienceResolution,
+        activePushRecipients,
+      });
+      if (!dryRun && !testTeamId) {
+        await insertRunRecord(dispatchItem, 'skipped_no_active_recipients', {
+          audienceResolution: payloadResult.audienceResolution,
+          activePushRecipients,
+        }, existingRun);
+      }
+      continue;
+    }
+
     if (dryRun) {
       results.push({
         status: inWindow ? 'would_send' : 'would_not_send_outside_window',
@@ -915,6 +1209,7 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes, ignoreSendWi
         testTeamId,
         payload: payloadResult.payload,
         audienceResolution: payloadResult.audienceResolution,
+        activePushRecipients,
       });
       continue;
     }
@@ -925,6 +1220,7 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes, ignoreSendWi
         await insertRunRecord(dispatchItem, 'sent', {
           sendResult,
           audienceResolution: payloadResult.audienceResolution,
+          activePushRecipients,
         }, existingRun);
       }
       results.push({
@@ -935,6 +1231,7 @@ const dispatchDueItems = async ({ date, dryRun, now, windowMinutes, ignoreSendWi
         testTeamId,
         sendResult,
         audienceResolution: payloadResult.audienceResolution,
+        activePushRecipients,
       });
     } catch (error) {
       if (!testTeamId) {
